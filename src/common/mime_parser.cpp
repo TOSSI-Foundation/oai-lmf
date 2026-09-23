@@ -136,9 +136,10 @@ void mime_parser::create_multipart_related_content(
 
   body.append("--" + boundary + CRLF);
   if (content_type == multipart_related_content_part_e::NAS) {  // NAS
+    // The only N1 part this LMF sends is LPP (TS 29.518 6.1.6.4.2).
     body.append(
         "Content-Type: application/vnd.3gpp.5gnas" + CRLF +
-        "Content-Id: " + N2_NRPPa_CONTENT_ID + CRLF);
+        "Content-Id: " + N1_LPP_CONTENT_ID + CRLF);
   } else if (content_type == multipart_related_content_part_e::NGAP) {  // NGAP
     body.append(
         "Content-Type: application/vnd.3gpp.ngap" + CRLF +

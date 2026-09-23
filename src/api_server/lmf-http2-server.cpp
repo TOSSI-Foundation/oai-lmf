@@ -16,6 +16,7 @@
 #include <string>
 
 #include "3gpp_29.500.h"
+#include "N1MessageNotification.h"
 #include "N2InformationNotification.h"
 #include "ProblemDetails.h"
 #include "lmf_config.hpp"
@@ -129,6 +130,46 @@ void lmf_http2_server::start() {
         });
         response.on_close([](uint32_t cause) {
           Logger::lmf_app().debug("stop ue: " + get_thread_id());
+        });
+      });
+
+  // /nlmf-n1-notify/v1/lpp/callback/imsi-208950000000131 (TS 29.518 5.2.2.3.5, class LPP)
+  server.handle(
+      lmf_sbi_helper::LmfN1NotifyServiceBase +
+          lmf_sbi_helper::LmfN1NotifyLppCallback,
+      [&](const request& request, const response& response) {
+        auto requestBody = std::make_shared<std::stringstream>();
+        request.on_data([requestBody, &request, &response, this](
+                            const uint8_t* data, std::size_t len) {
+          try {
+            if (len > 0) {
+              std::copy(
+                  data, data + len,
+                  std::ostream_iterator<uint8_t>(*requestBody));
+            } else {
+              auto const& msg = requestBody->str();
+              requestBody->clear();
+              std::filesystem::path path{request.uri().path};
+              std::vector<std::string> split_result{path.begin(), path.end()};
+              if (msg.size() == 0 || request.method().compare("POST") != 0 ||
+                  split_result.size() != 6) {
+                throw std::invalid_argument("invalid request");
+              }
+              mime_parser sp;
+              if (!sp.parse(msg)) {
+                throw std::invalid_argument{"can not parse multipart"};
+              }
+              std::vector<mime_part> parts;
+              sp.get_mime_parts(parts);
+              this->n1_lpp_notification_post_handler(
+                  split_result.at(5), parts, response);
+            }
+          } catch (std::exception& e) {
+            Logger::lmf_server().warn("Invalid N1 LPP notification (%s)", e.what());
+            response.write_head(
+                oai::common::sbi::http_status_code::BAD_REQUEST);
+            response.end();
+          }
         });
       });
 
@@ -278,6 +319,57 @@ void lmf_http2_server::n2info_nrppa_notification_post_handler(
             << std::endl;
   response.write_head(code, h);
   response.end(reason);
+}
+
+void lmf_http2_server::n1_lpp_notification_post_handler(
+    const std::string& ueContextId, std::vector<mime_part>& parts,
+    const response& response) {
+  // multipart/related: the N1MessageNotification JSON root first, then one application/vnd.3gpp.5gnas part
+  // carrying the uplink LPP PDU (TS 29.518 6.1.2.4, 6.1.6.4.2).
+  unsigned code = oai::common::sbi::http_status_code::NO_CONTENT;
+  std::string detail;
+  try {
+    if (parts.size() != 2 || parts.at(1).content_type.find("vnd.3gpp.5gnas") ==
+                                 std::string::npos) {
+      throw std::invalid_argument{
+          "expected a JSON part and one application/vnd.3gpp.5gnas part"};
+    }
+    N1MessageNotification notification{nlohmann::json::parse(parts.at(0).body)};
+    if (notification.getN1MessageContainer().getN1MessageClass().getEnumValue() !=
+        N1MessageClass_anyOf::eN1MessageClass_anyOf::LPP) {
+      throw std::invalid_argument{"n1MessageClass is not LPP"};
+    }
+    // Required for LPP: TS 29.518 5.2.2.3.5.3 step 2, TS 23.273 6.11.1 step 7.
+    if (!notification.lcsCorrelationIdIsSet()) {
+      throw std::invalid_argument{"lcsCorrelationId missing"};
+    }
+    Logger::lmf_server().info(
+        "N1MessageNotify LPP for %s, correlation %s, %zu bytes", ueContextId,
+        notification.getLcsCorrelationId(), parts.at(1).body.size());
+    m_lmf_app->handle_n1_lpp_notification(
+        ueContextId, notification.getLcsCorrelationId(), parts.at(1).body);
+  } catch (Pistache::Http::HttpError& e) {
+    code   = e.code();
+    detail = e.what();
+  } catch (std::exception& e) {
+    code   = oai::common::sbi::http_status_code::BAD_REQUEST;
+    detail = e.what();
+  }
+  if (code == oai::common::sbi::http_status_code::NO_CONTENT) {
+    // 204 No Content, empty body (TS 29.518 6.1.5.4.3.1).
+    response.write_head(code);
+    response.end();
+    return;
+  }
+  Logger::lmf_server().warn("N1MessageNotify LPP rejected: %s", detail);
+  ProblemDetails problemDetails;
+  problemDetails.setTitle("N1MessageNotify (LPP)");
+  problemDetails.setDetail(detail);
+  header_map h;
+  h.insert(std::make_pair<std::string, header_value>(
+      "Content-Type", {"application/problem+json", false}));
+  response.write_head(code, h);
+  response.end(nlohmann::json(problemDetails).dump());
 }
 
 void lmf_http2_server::detemine_location_post_handler(

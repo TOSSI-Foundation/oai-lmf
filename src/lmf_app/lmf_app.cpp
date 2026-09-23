@@ -12,6 +12,13 @@
 #include <boost/range/algorithm.hpp>
 #include <boost/range/irange.hpp>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <map>
+#include <set>
 #include <iostream>
 #include <iterator>
 #include <optional>
@@ -41,8 +48,17 @@
 #include "InitiatingMessage.h"
 #include "ProtocolIE-Field.h"
 #include "SuccessfulOutcome.h"
+#include "NG-RANAccessPointPosition.h"
 #include "TRP-MeasurementResponseItem.h"
-#include "TRPInformationItem.h"
+#include "TRPInformationTypeResponseItem.h"
+#include "PRSConfiguration.h"
+#include "PRSResourceSet-Item.h"
+#include "PRSResource-Item.h"
+#include "TRPInformationTypeListTRPReq.h"
+#include "TRPInformationTypeItem.h"
+#include "TRPPositionDirect.h"
+#include "TRPPositionDirectAccuracy.h"
+#include "NGRANHighAccuracyAccessPointPosition.h"
 #include "TRPItem.h"
 #include "TrpMeasuredResultsValue.h"
 #include "TrpMeasurementResultItem.h"
@@ -77,6 +93,12 @@ auto end(T const& container) {
 }
 
 //------------------------------------------------------------------------------
+static unsigned env_uint(char const* name, unsigned fallback) {
+  char const* v = std::getenv(name);
+  return (v && *v) ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) :
+                     fallback;
+}
+
 lmf_app::lmf_app(const std::string& config_file, lmf_event& ev)
     : event_sub(ev) {}
 
@@ -105,11 +127,59 @@ bool lmf_app::start() {
     }
   }
   Logger::lmf_app().startup("Started");
+
+  // Periodic positioning without an external client:
+  //   LMF_AUTO_SUPI="imsi-001010000000003[,imsi-...]"  UEs to locate
+  //   LMF_AUTO_INTERVAL_S=5                            pause between fixes
+  // Each result is logged ("auto position") and appended as one JSON line to
+  // LMF_AUTO_OUTPUT (default /openair-lmf/positions/positions.jsonl).
+  if (char const* supis = std::getenv("LMF_AUTO_SUPI"); supis && *supis) {
+    auto_running = true;
+    auto_thread  = std::thread([this, list = std::string(supis)] {
+      unsigned const interval_s = env_uint("LMF_AUTO_INTERVAL_S", 5);
+      char const* out_env       = std::getenv("LMF_AUTO_OUTPUT");
+      std::string const out     = (out_env && *out_env) ?
+                                      out_env :
+                                      "/openair-lmf/positions/positions.jsonl";
+      Logger::lmf_app().info(
+          "auto positioning: supi(s) %s every %us -> %s", list, interval_s,
+          out);
+      while (auto_running) {
+        std::stringstream ss(list);
+        for (std::string supi; std::getline(ss, supi, ',') && auto_running;) {
+          nlohmann::json j;
+          Pistache::Http::Code code = {};
+          try {
+            InputData input;
+            input.setSupi(supi);
+            this->handle_determine_location(input, j, code);
+          } catch (std::exception const& e) {
+            j = nlohmann::json{{"error", e.what()}};
+          }
+          // Same cleanup as the HTTP handler does on failure.
+          this->release_all_n1n2subscriptions();
+          this->release_non_ue_subscription();
+
+          j["supi"] = supi;
+          j["time"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+          Logger::lmf_app().info("auto position: %s", j.dump());
+          if (std::ofstream f{out, std::ios::app}; f) f << j.dump() << "\n";
+        }
+        for (unsigned i = 0; i < interval_s * 10 && auto_running; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      }
+    });
+  }
   return true;
 }
 
 //------------------------------------------------------------------------------
 void lmf_app::stop() {
+  auto_running = false;
+  if (auto_thread.joinable()) auto_thread.join();
   if (lmf_nrf_inst and lmf_cfg.register_nrf) {
     lmf_nrf_inst->deregister_to_nrf();
     delete lmf_nrf_inst;
@@ -139,6 +209,38 @@ void lmf_app::trp_information_request(
           },
   };
 
+  // TRP Information Type List is mandatory (TS 38.455 9.1.2.1); ask for what
+  // handle_trp_information_response() consumes.
+  auto trpInformationTypeListIe = (TRPInformationRequest_IEs_t*) calloc(
+      1, sizeof(TRPInformationRequest_IEs_t));
+  trpInformationTypeListIe->id = ProtocolIE_ID_id_TRPInformationTypeListTRPReq;
+  trpInformationTypeListIe->criticality = Criticality_reject;
+  trpInformationTypeListIe->value.present =
+      TRPInformationRequest_IEs__value_PR_TRPInformationTypeListTRPReq;
+  for (auto const type :
+       {TRPInformationTypeItem_nrPCI, TRPInformationTypeItem_nG_RAN_CGI,
+        TRPInformationTypeItem_arfcn, TRPInformationTypeItem_geoCoord,
+        // for NR-DL-PRS-AssistanceData, 37.355 6.4.3 (TS 38.305 8.10.2.1: the LMF obtains it from the gNB)
+        TRPInformationTypeItem_pRSConfig,
+        // SFN Initialisation Time: turns measurement (SFN, slot) timestamps into absolute time, needed to know
+        // where the satellite was for each round trip (NTN, TS 38.305 8.10)
+        TRPInformationTypeItem_sFNInitTime}) {
+    auto item = (TRPInformationTypeItemTRPReq_t*) calloc(
+        1, sizeof(TRPInformationTypeItemTRPReq_t));
+    item->id          = ProtocolIE_ID_id_TRPInformationTypeItem;
+    item->criticality = Criticality_reject;
+    item->value.present =
+        TRPInformationTypeItemTRPReq__value_PR_TRPInformationTypeItem;
+    item->value.choice.TRPInformationTypeItem = type;
+    ASN_SEQUENCE_ADD(
+        &trpInformationTypeListIe->value.choice.TRPInformationTypeListTRPReq
+             .list,
+        item);
+  }
+  ASN_SEQUENCE_ADD(
+      &initiatingMessage->value.choice.TRPInformationRequest.protocolIEs.list,
+      trpInformationTypeListIe);
+
   auto nrppaPdu = (NRPPA_PDU_t*) malloc(sizeof(NRPPA_PDU_t));
   *nrppaPdu     = NRPPA_PDU_t{
       .present = NRPPA_PDU_PR_initiatingMessage,
@@ -158,12 +260,11 @@ void lmf_app::trp_information(
     std::shared_ptr<LocationDetermination> const& ctx) {
   std::unique_lock lk{this->cv_m_gnb};
 
-  if (this->gnb.size() > 0) {
-    Logger::lmf_app().debug(
-        "trp information request: alreadey done: gnbs: %d trps: %d",
-        this->gnb.size(), this->numTrps());
-    return;
-  }
+  // Always re-query: a gNB (e.g. OCUDU) only accepts UE positioning requests
+  // after it has answered a TRP Information request itself, so a cached list
+  // breaks as soon as a gNB restarts. It also picks up moved TRPs.
+  // ponytail: concurrent determine-location requests share this map.
+  this->gnb.clear();
 
   auto const& tId = this->nrppa_tid_gen.get_uid();
   this->trp_information_request(ctx, tId);
@@ -181,7 +282,10 @@ void lmf_app::trp_information(
       lmf_cfg.determine_num_gnb ? "until timeout" :
                                   std::to_string(lmf_cfg.num_gnb));
   auto const& rc = this->cv_gnb.wait_for(lk, lmf_cfg.trp_info_wait_ms, pred);
-  ctx->nrppa_tId.erase(tId);
+  {
+    std::scoped_lock lk{ctx->m_tId};
+    ctx->nrppa_tId.erase(tId);
+  }
   this->nrppa_tid_gen.free_uid(tId);
   this->erase_nrppaTxnId2Supi(tId);
   if (this->trp_info_err.size() > 0) {
@@ -234,9 +338,45 @@ void lmf_app::handle_determine_location(
     return;
   }
 
+  // LCS correlation ID of this location session: the AMF's, when it sent one in Nlmf_Location_DetermineLocation
+  // (TS 23.273 6.1.1 step 7, InputData.correlationID in TS 29.572); otherwise this LMF assigns one, from its
+  // own "lmf-" range so the two kinds stay distinguishable (TS 24.501 5.4.5.3.2 NOTE 2, TS 23.273 6.3.1
+  // NOTE 11). The auto-positioning loop, standing in for an AMF-triggered request, lands in the second case.
+  ctx->lcs_correlation_id =
+      inputData.correlationIDIsSet() && !inputData.getCorrelationID().empty() ?
+          inputData.getCorrelationID() :
+          "lmf-"s + std::to_string(++this->lmf_correlation_counter);
+
   this->create_non_ue_subscription();
   this->trp_information(ctx);
   this->create_n1n2subscription(supi);
+
+  // LPP Capability Transfer (TS 37.355 5.1.1) over N1. Phase 1 of the Multi-RTT work: it proves the LPP path
+  // end to end and must not take the working NRPPa positioning below down with it, so a failure is logged.
+  bool multi_rtt = false, ntn = false;
+  try {
+    auto const lpp = ctx->lpp_capability_transfer();
+    Logger::lmf_app().info("LPP capability transfer: %s", lpp.dump());
+    multi_rtt = lpp.value("nrMultiRttCapable", false);
+    ntn       = lpp.value("nrNtnMeasAndReport", false);
+    // TS 38.305 8.10.2.1 step 3: the DL-PRS the UE is to measure, before it is asked to measure.
+    if (multi_rtt) {
+      auto const assigned = ctx->lpp_provide_assistance_data(this->gnb);
+      if (assigned.empty()) {
+        Logger::lmf_app().warn("LPP assistance data: no TRP reported a PRS Configuration");
+      } else {
+        std::scoped_lock lk{this->cv_m_gnb};
+        for (auto const& [gnbId, trpId, id] : assigned) {  // Gnb has no default constructor: find, never [].
+          auto const g = this->gnb.find(gnbId);
+          if (g == this->gnb.end()) continue;
+          auto const t = g->second.trp.find(trpId);
+          if (t != g->second.trp.end()) t->second.dl_prs_id = id;
+        }
+      }
+    }
+  } catch (std::exception const& e) {
+    Logger::lmf_app().warn("LPP capability transfer failed: %s", e.what());
+  }
 
   auto const& res = ctx->positioning_information_request();
   if (std::holds_alternative<CauseError>(res)) {
@@ -251,27 +391,40 @@ void lmf_app::handle_determine_location(
 
   // 5. NRPPa Request UE SRS activation
   // 9.1.1.17 POSITIONING ACTIVATION REQUEST
-  auto const& pares = ctx->positioning_activation_request();
-  if (std::holds_alternative<CauseError>(pares)) {
-    auto const& err = std::get<CauseError>(pares);
-    ctx->throwHttpError("positioning activation request failure", err.msg());
-  }
-  auto const& nrppaPduPA = std::get<LocationDetermination::pos_act_succ>(pares);
-  // xer_fprint(stdout, &asn_DEF_NRPPA_PDU, nrppaPduPA.get());
+  // Skipped: activation only starts semi-persistent/aperiodic SRS. When the
+  // gNB measures the UE's periodic SRS there is nothing to activate, and gNBs
+  // that do not implement the F1AP Positioning Activation procedure (e.g.
+  // OCUDU, whose DU has no handler for it) let the request time out, which
+  // would abort this whole procedure. Same reason the deactivation call below
+  // is left out.
+  // ctx->positioning_activation_request();
 
-  for (auto const& [id, gnb] : this->gnb) {
-    auto const& res = ctx->measurement_request(gnb, ueSrsConfiguration);
-
-    if (std::holds_alternative<CauseError>(res)) {
-      auto const& err = std::get<CauseError>(res);
-      ctx->throwHttpError("measurement request failure", err.msg());
+  // Measure all gNBs together, several times; compute_location() takes the
+  // median. LMF_MEAS_ROUNDS (default 5) rounds are kept; rounds where the
+  // gNBs did not measure the same SRS occasion are dropped and retried.
+  unsigned const rounds_wanted = env_uint("LMF_MEAS_ROUNDS", 5);
+  unsigned accepted            = 0;
+  for (unsigned attempt = 0;
+       accepted < rounds_wanted && attempt < 3 * rounds_wanted; ++attempt) {
+    if (ctx->measurement_round(this->gnb, ueSrsConfiguration)) {
+      ++accepted;
+      // NR Multi-RTT (TS 38.305 8.10): the UE's half of the round trip for this round, over LPP. Its
+      // failures are logged, never allowed to break the NRPPa positioning around it.
+      if (multi_rtt) {
+        try {
+          auto round = ctx->lpp_multi_rtt_round(ntn);
+          if (round.value("paired", false)) this->ntn_record(supi, round);
+        } catch (std::exception const& e) {
+          Logger::lmf_app().warn("Multi-RTT round failed: %s", e.what());
+        }
+      }
     }
-    auto const& [nrppaPduMR, trpMeasurementList] =
-        std::get<LocationDetermination::mmr_succ>(res);
-
-    // xer_fprint(stdout, &asn_DEF_NRPPA_PDU, nrppaPduMR.get());
-
-    ctx->collectResult(gnb, trpMeasurementList);
+  }
+  if (accepted == 0) {
+    ctx->throwHttpError(
+        "measurement"s, "no round where all TRPs measured the same SRS "
+                        "occasion (rejected: "s +
+                            std::to_string(ctx->rounds_rejected) + ")"s);
   }
 
   // In positioning_deactivation()
@@ -280,7 +433,25 @@ void lmf_app::handle_determine_location(
   // ctx->positioning_deactivation_request();
 
   code                = Pistache::Http::Code::Ok;
-  auto const& locData = ctx->compute_location(this->gnb);
+  // NTN: the UE location from the round trips to one satellite at different instants (TS 38.305 8.10), solved
+  // over this UE's history before the terrestrial solver below, which needs several TRPs and throws without.
+  nlohmann::json ntn_fix;
+  if (multi_rtt) ntn_fix = this->ntn_solve(supi);
+  // The terrestrial solver needs several TRPs at known, distinct, FIXED positions. In NTN the TRP is on board
+  // the satellite (TS 38.305 5.4.2) and moves, so its geo_coordinates IE is only a placeholder - both cells
+  // report the same cell reference location - and the solver rightly refuses with "the two TRPs must be at
+  // least 1 m apart". That must not bury the NTN fix, which is the answer this deployment is after.
+  nlohmann::json locData;
+  auto const ntn_status = ntn_fix.is_null() ? std::string{} : ntn_fix.value("status", std::string{});
+  try {
+    locData = ctx->compute_location(this->gnb);
+  } catch (...) {
+    if (ntn_status != "ok" && ntn_status != "ambiguous") throw;
+    Logger::lmf_app().info("terrestrial solver not applicable (TRPs on satellites); reporting the NTN fix");
+    locData = nlohmann::json::object();
+  }
+  if (!ntn_fix.is_null()) locData["ntnFix"] = ntn_fix;
+  if (!ctx->multi_rtt_rounds.empty()) locData["multiRtt"] = ctx->multi_rtt_rounds;
   // using hard coded location data as adeel requiered
   // can not use rel16 LocationData here, incompatible with rel17 values
   // LocationData locationData{locData};
@@ -289,6 +460,220 @@ void lmf_app::handle_determine_location(
   this->del_supi_2_context(supi);
 
   return;
+}
+
+//------------------------------------------------------------------------------
+// One paired Multi-RTT round of this UE as (absolute time, service-link range, satellite position).
+void lmf_app::ntn_record(std::string const& supi, nlohmann::json& round) {
+  // The TRP this round was measured at: the gNB Rx-Tx carries its gNB, and its SFN Initialisation Time is what
+  // turns the (SFN, slot) timestamp into an absolute instant.
+  std::optional<double> sfn0;
+  uint64_t gnb_of_round = round.value("gnbId", uint64_t{0});
+  long trp_of_round     = round.value("trpId", 1L);
+  // Every TRP the UE was given assistance data for, by dl-PRS-ID: the gNB and TRP it is, which is how a
+  // measurement the UE reports against a dl-PRS-ID finds its satellite.
+  struct trp_ref { uint64_t gnb; long trp; };
+  std::map<long, trp_ref> by_dl_prs_id;
+  {
+    std::scoped_lock lk{this->cv_m_gnb};
+    for (auto const& [gnbId, g] : this->gnb)
+      for (auto const& [trpId, trp] : g.trp) {
+        if (!sfn0 && trp.sfn0_unix && (gnb_of_round == 0 || gnbId == gnb_of_round)) {
+          sfn0          = trp.sfn0_unix;
+          gnb_of_round  = gnbId;
+          trp_of_round  = trpId;
+        }
+        if (trp.dl_prs_id) by_dl_prs_id.emplace(*trp.dl_prs_id, trp_ref{gnbId, trpId});
+      }
+  }
+  if (!sfn0) {
+    Logger::lmf_app().warn("NTN Multi-RTT: no SFN Initialisation Time from the TRP, round not timed");
+    return;
+  }
+  // Absolute time of the SRS the gNB Rx-Tx was measured on: SFN0 + (SFN, slot), on the 10.24 s SFN cycle that
+  // ends last before now (the response arrives after the measurement). 15 kHz: one slot per ms.
+  double const now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+  double const base = *sfn0 + (round["gnbSfn"].get<long>() * 10 + round["gnbSlot"].get<long>()) * 1e-3;
+  double t = base + std::floor((now - base) / 10.24) * 10.24;
+  if (t > now) t -= 10.24;
+  // Which satellite carried that TRP at that instant: with a satellite switch the same cell changes satellite
+  // mid-session, so this is a function of time (TS 38.305 5.4: the association comes from OAM).
+  std::string error;
+  auto const sat = ntn::satellite_for(gnb_of_round, trp_of_round, t, error);
+  if (!sat) {
+    Logger::lmf_app().warn("NTN Multi-RTT: %s", error);
+    return;
+  }
+  double rtt = round["rttUs"].get<double>();
+
+  std::scoped_lock lk{m_ntn};
+  auto& h = ntn_history[supi];
+  if (!h.empty() && (t < h.back().t_unix || t - h.back().t_unix > 120)) {
+    Logger::lmf_app().info("NTN Multi-RTT %s: history restarted (%.1f s after the last round)", supi, t - h.back().t_unix);
+    h.clear();
+    ntn_last_rtt_rate.erase(supi);
+  }
+  // The two halves describe different uplink subframes: the gNB Rx-Tx the SRS's, the UE Rx-Tx - measured on DL
+  // subframe i - the UL subframe i + offset it transmits then (TS 38.215 5.1.30, 5.1.46). Move the UE half to the
+  // SRS's subframe at the rate the round trip changed between rounds (the gNB half barely moves: the UE's timing
+  // advance tracks the link). Without this the pair is (PRS slot - SRS slot + offset) ms apart - 9 to 24 ms here,
+  // which at 46 us/s of drift was the whole of the -0.8 us "bias" of phase 3.
+  double const gap_s =
+      (round["ueSlot"].get<long>() + round["subframeOffset"].get<long>() - round["gnbSlot"].get<long>()) * 1e-3;
+  if (auto r = ntn_last_rtt_rate.find(supi); r != ntn_last_rtt_rate.end()) rtt -= r->second * gap_s;
+  // The rate at which the round trip moves, from this satellite's own previous round - the history may also
+  // hold neighbour satellites' ranges, which are a different geometry and would give a meaningless rate.
+  auto const prev = std::find_if(h.rbegin(), h.rend(), [&](auto const& r) { return r.sat_id == sat->id; });
+  if (prev != h.rend() && t > prev->t_unix) {
+    double const prev_rtt = 2 * prev->range_m / 299792458.0 * 1e6 + sat->common_delay_us + sat->rtt_calibration_ns / 1e3;
+    ntn_last_rtt_rate[supi] = (rtt - prev_rtt) / (t - prev->t_unix);
+  }
+  double const range = (rtt - sat->common_delay_us - sat->rtt_calibration_ns / 1e3) * 1e-6 * 299792458.0 / 2;
+  h.push_back({t, range, ntn::ecef_at(*sat, t), sat->id});
+  while (!h.empty() && t - h.front().t_unix > 900) h.erase(h.begin());  // one pass
+  Logger::lmf_app().info(
+      "NTN Multi-RTT round %s: t %.6f (SFN0 %.6f + sfn %ld slot %ld), RTT at SRS %.3f us -> range %.3f m, "
+      "satellite %d at %.1f %.1f %.1f",
+      supi, t, *sfn0, round["gnbSfn"].get<long>(), round["gnbSlot"].get<long>(), rtt, range, sat->id,
+      h.back().sat[0], h.back().sat[1], h.back().sat[2]);
+  round["tUnix"]        = t;
+  round["rangeKmAtSrs"] = range / 1e3;
+  round["satelliteId"]  = sat->id;
+
+  // Neighbour TRPs - in NTN, the other satellites over this UE (TS 38.305 5.4.2, 5.4.4).
+  //
+  // Write the UE's measurement of TRP i, in its own frame grid, as
+  //
+  //   arrival_i = t_ul(0) + subframe_i + R_i        (R_i = UE Rx-Tx, its whole advance, TS 38.215 5.1.30/5.1.46)
+  //   arrival_i = sfn0_ref + subframe_i + r_i / c   (the TRP transmitted that occasion, then it flew)
+  //
+  // The second line holds for EVERY TRP with the same sfn0_ref because the UE applies each TRP's
+  // nr-DL-PRS-SFN0-Offset (37.355 6.4.3) when it looks for that TRP's occasions: after it does, the occasion it
+  // sees in its subframe n was transmitted at the same absolute instant by all of them. Subtracting the two
+  // lines, the subframe and both constants cancel:
+  //
+  //   r_j - r_ref = c (R_j - R_ref)
+  //
+  // so the round trip that fixed r_ref hands every neighbour an ABSOLUTE range, not just a difference. Two
+  // absolute ranges at one instant place the UE without waiting for a pass. The measurements need not fall in
+  // the same subframe - the two TRPs' grids are offset by their SFN0 offset - so each neighbour's range is
+  // timestamped at its own occasion.
+  if (!round.contains("trps") || round["trps"].size() < 2) return;
+  auto const& ts = round["trps"];
+  double const r_ref_us  = ts[0]["ueRxTxUs"].get<double>();
+  long const   sub_ref   = ts[0]["sfn"].get<long>() * 10 + ts[0]["slot"].get<long>();
+  for (size_t i = 1; i < ts.size(); ++i) {
+    long const id = ts[i]["dlPrsId"].get<long>();
+    auto const it = by_dl_prs_id.find(id);
+    if (it == by_dl_prs_id.end()) {
+      Logger::lmf_app().warn("NTN Multi-RTT: measurement for dl-PRS-ID %ld, which this session never assisted", id);
+      continue;
+    }
+    long gap_ms = (ts[i]["sfn"].get<long>() * 10 + ts[i]["slot"].get<long>()) - sub_ref;
+    gap_ms = (gap_ms % 10240 + 10240) % 10240;          // the SFN cycle wraps
+    if (gap_ms > 5120) gap_ms -= 10240;
+    // Two TRPs' occasions can sit up to one DL-PRS period apart on the UE's grid (their SFN0 offset), no
+    // further. Anything beyond that is not one instant - it is a TRP the UE stopped hearing whose last
+    // measurement is being repeated - and differencing it against a current one puts the range out by
+    // hundreds of kilometres. Two periods of slack, then refuse.
+    constexpr long max_gap_ms = 320;
+    if (gap_ms > max_gap_ms || gap_ms < -max_gap_ms) {
+      Logger::lmf_app().warn(
+          "NTN Multi-RTT: dl-PRS-ID %ld measured %+ld ms from the reference TRP - not one instant, discarded",
+          id, gap_ms);
+      continue;
+    }
+    double const t_j = t + gap_ms * 1e-3;
+    std::string err_j;
+    auto const sat_j = ntn::satellite_for(it->second.gnb, it->second.trp, t_j, err_j);
+    if (!sat_j) {
+      Logger::lmf_app().warn("NTN Multi-RTT: dl-PRS-ID %ld: %s", id, err_j);
+      continue;
+    }
+    // A round trip of this TRP's own is better than a difference against the reference: it does not inherit
+    // the reference's error, and it needs no assumption about the two downlinks sharing a transmit instant.
+    bool const   own_rtt = ts[i].contains("rttUs");
+    double const range_j =
+        own_rtt ? (ts[i]["rttUs"].get<double>() - sat_j->common_delay_us - sat_j->rtt_calibration_ns / 1e3) *
+                      1e-6 * 299792458.0 / 2
+                : range + (ts[i]["ueRxTxUs"].get<double>() - r_ref_us) * 1e-6 * 299792458.0;
+    // A range that is not a range: beyond the geometry any satellite over this UE can have.
+    if (range_j < 100e3 || range_j > 4000e3) {
+      Logger::lmf_app().warn(
+          "NTN Multi-RTT: dl-PRS-ID %ld gives range %.1f km (reference %.1f km) - discarded", id, range_j / 1e3,
+          range / 1e3);
+      continue;
+    }
+    auto const pos_j = ntn::ecef_at(*sat_j, t_j);
+    h.push_back({t_j, range_j, pos_j, sat_j->id});
+    Logger::lmf_app().info(
+        "NTN Multi-RTT round %s: t %.6f neighbour dl-PRS-ID %ld (gnbId 0x%x trpId %d), %s -> range %.3f m, "
+        "satellite %d at %.1f %.1f %.1f",
+        supi, t_j, id, it->second.gnb, it->second.trp,
+        own_rtt ? ("own round trip " + std::to_string(ts[i]["rttUs"].get<double>()) + " us").c_str()
+                : ("UE Rx-Tx " + std::to_string(ts[i]["ueRxTxUs"].get<double>()) + " us vs reference " +
+                   std::to_string(r_ref_us) + " us (" + std::to_string(gap_ms) + " ms)").c_str(),
+        range_j, sat_j->id, pos_j[0], pos_j[1], pos_j[2]);
+    round["trps"][i]["tUnix"]       = t_j;
+    round["trps"][i]["rangeKm"]     = range_j / 1e3;
+    round["trps"][i]["satelliteId"] = sat_j->id;
+  }
+  // The history is appended out of order when a neighbour's occasion precedes the reference's; the solver and
+  // the pruning below both read it as a time series.
+  std::sort(h.begin(), h.end(), [](auto const& a, auto const& b) { return a.t_unix < b.t_unix; });
+}
+
+//------------------------------------------------------------------------------
+nlohmann::json lmf_app::ntn_solve(std::string const& supi) {
+  std::vector<ntn::range_meas> m;
+  {
+    std::scoped_lock lk{m_ntn};
+    m = ntn_history[supi];
+  }
+  double const span = m.empty() ? 0 : m.back().t_unix - m.front().t_unix;
+  // One satellite has to be given time: its ranges only separate the UE's position as the pass matures. Two
+  // satellites at once are already two ranges from two directions, so three of them place the UE at once.
+  std::set<int> sats;
+  for (auto const& r : m) sats.insert(r.sat_id);
+  bool const enough = sats.size() > 1 ? (m.size() >= 3) : (m.size() >= 5 && span >= 20);
+  if (!enough) {
+    Logger::lmf_app().info("NTN Multi-RTT fix %s: not yet (%zu rounds from %zu satellite(s) over %.0f s)", supi,
+                           m.size(), sats.size(), span);
+    return {{"status", "insufficient"}, {"rounds", m.size()}, {"spanS", span}, {"satellites", sats.size()}};
+  }
+  auto const fixes = ntn::solve(m);
+  if (fixes.empty()) {
+    Logger::lmf_app().warn("NTN Multi-RTT fix %s: no convergence (%zu rounds over %.0f s)", supi, m.size(), span);
+    return {{"status", "noConvergence"}, {"rounds", m.size()}, {"spanS", span}};
+  }
+  auto const& f = fixes.front();
+  nlohmann::json alt = nlohmann::json::array();
+  std::string alts;
+  for (size_t i = 1; i < fixes.size(); i++) {
+    alt.push_back({{"latDeg", fixes[i].lat_deg}, {"lonDeg", fixes[i].lon_deg}, {"rmsM", fixes[i].rms_m}});
+    alts += " | alt " + std::to_string(fixes[i].lat_deg) + "," + std::to_string(fixes[i].lon_deg) + " rms " +
+            std::to_string(int(fixes[i].rms_m)) + " m";
+  }
+  // One pass can fit a second point nearly as well (before the satellite passes the UE, the range profile does
+  // not yet tell which side along the track it is on): then the fix is not unique and is reported as such.
+  bool const ambiguous = fixes.size() > 1 && fixes[1].rms_m < 2 * f.rms_m;
+  Logger::lmf_app().info(
+      "NTN Multi-RTT fix %s: lat %.6f lon %.6f, 1-sigma %.0f x %.0f m (major axis %.0f deg from north), "
+      "range rms %.1f m, %d rounds over %.0f s%s%s",
+      supi, f.lat_deg, f.lon_deg, f.semi_major_m, f.semi_minor_m, f.orient_deg, f.rms_m, f.n, f.span_s,
+      ambiguous ? " AMBIGUOUS" : "", alts);
+  return {{"status", ambiguous ? "ambiguous" : "ok"},
+          {"satellites", sats.size()},
+          {"latDeg", f.lat_deg},
+          {"lonDeg", f.lon_deg},
+          {"ecefM", f.ecef},
+          {"uncertaintySemiMajorM", f.semi_major_m},
+          {"uncertaintySemiMinorM", f.semi_minor_m},
+          {"orientationMajorAxisDeg", f.orient_deg},
+          {"rangeRmsM", f.rms_m},
+          {"rounds", f.n},
+          {"spanS", f.span_s},
+          {"alternatives", alt}};
 }
 
 //------------------------------------------------------------------------------
@@ -440,21 +825,21 @@ void lmf_app::handle_trp_information_response(
   std::scoped_lock lk{this->cv_m_gnb};
 
   for (auto const& trpInformationIE : trpInformation.protocolIEs) {
-    if (trpInformationIE->id == ProtocolIE_ID_id_TRPInformationList) {
+    if (trpInformationIE->id == ProtocolIE_ID_id_TRPInformationListTRPResp) {
       auto const& value              = trpInformationIE->value;
       auto const& trpInformationList = getPR(
-          value.choice.TRPInformationList, value,
-          TRPInformationResponse_IEs__value_PR_TRPInformationList);
+          value.choice.TRPInformationListTRPResp, value,
+          TRPInformationResponse_IEs__value_PR_TRPInformationListTRPResp);
       for (auto const& trpInformationListMember : trpInformationList) {
-        auto const& trpId = trpInformationListMember->tRP_ID;
+        auto const& trpId = trpInformationListMember->tRPInformation.tRP_ID;
         std::optional<GnbId> gnbId;
         Trp trp;
 
         for (auto const& trpInformationItem :
-             trpInformationListMember->tRPInformation) {
+             trpInformationListMember->tRPInformation.tRPInformationTypeResponseList) {
           switch (trpInformationItem->present) {
-            case TRPInformationItem_PR_nG_RAN_CGI: {
-              auto const& ngRanCgi      = trpInformationItem->choice.nG_RAN_CGI;
+            case TRPInformationTypeResponseItem_PR_cGI_NR: {
+              auto const& ngRanCgi      = trpInformationItem->choice.cGI_NR;
               auto const& plmnnIdentity = ngRanCgi->pLMN_Identity;
               if (plmnnIdentity.size != 3) {
                 oai::lmf::api::lmf_sbi_helper::throwHttpError(
@@ -463,8 +848,8 @@ void lmf_app::handle_trp_information_response(
                         std::to_string(plmnnIdentity.size));
               }
 
-              if (ngRanCgi->nG_RANcell.present == NG_RANCell_PR_nR_CellID) {
-                auto const& ngRanCell = ngRanCgi->nG_RANcell.choice.nR_CellID;
+              {
+                auto const& ngRanCell = ngRanCgi->nRcellIdentifier;
                 if (ngRanCell.size != 5 || ngRanCell.bits_unused != 4) {
                   oai::lmf::api::lmf_sbi_helper::throwHttpError(
                       "trp information response",
@@ -540,16 +925,40 @@ void lmf_app::handle_trp_information_response(
                             " already inserted"s);
                   }
                 }
-              } else {
-                oai::lmf::api::lmf_sbi_helper::throwHttpError(
-                    "trp information response",
-                    "TRPInformationItem_PR_nG_RAN_CGI not present, but: "s +
-                        std::to_string(ngRanCgi->nG_RANcell.present));
               }
 
             } break;
 
-            case TRPInformationItem_PR_geographicalCoordinates: {
+            case TRPInformationTypeResponseItem_PR_pCI_NR:
+              trp.pci = trpInformationItem->choice.pCI_NR;
+              break;
+            case TRPInformationTypeResponseItem_PR_sFNInitialisationTime: {
+              auto const& b = trpInformationItem->choice.sFNInitialisationTime;
+              if (b.size != 8) break;
+              uint64_t v = 0;
+              for (int i = 0; i < 8; i++) v = (v << 8) | b.buf[i];
+              trp.sfn0_unix = ntn::relative_time_1900_to_unix(v);
+            } break;
+            case TRPInformationTypeResponseItem_PR_aRFCN:
+              trp.arfcn = trpInformationItem->choice.aRFCN;
+              break;
+            case TRPInformationTypeResponseItem_PR_pRSConfiguration: {
+              auto const& sets = trpInformationItem->choice.pRSConfiguration->pRSResourceSet_List.list;
+              if (sets.count < 1 || sets.array[0]->pRSResource_List.list.count < 1) break;
+              if (sets.count > 1 || sets.array[0]->pRSResource_List.list.count > 1)
+                Logger::lmf_app().warn(
+                    "trp information: %d PRS resource sets, using the first set's first resource", sets.count);
+              auto const* s = sets.array[0];
+              auto const* r = s->pRSResource_List.list.array[0];
+              trp.prs = lpp::dl_prs{
+                  s->pRSResourceSetID, s->subcarrierSpacing, s->pRSbandwidth, s->startPRB,
+                  s->pointA, s->combSize, s->cPType, s->resourceSetPeriodicity, s->resourceSetSlotOffset,
+                  s->resourceRepetitionFactor, s->resourceTimeGap, s->resourceNumberofSymbols,
+                  s->pRSResourceTransmitPower, r->pRSResourceID, r->sequenceID, r->rEOffset,
+                  r->resourceSlotOffset, r->resourceSymbolOffset};
+            } break;
+
+            case TRPInformationTypeResponseItem_PR_geographicalCoordinates: {
               auto const& geographicalCoordinates =
                   trpInformationItem->choice.geographicalCoordinates;
               auto const& trpPositionDefinitionType =
@@ -590,6 +999,89 @@ void lmf_app::handle_trp_information_response(
 
                 } break;
 
+                case TRPPositionDefinitionType_PR_direct: {
+                  // A gNB may report an absolute antenna position instead of a
+                  // relative one (OCUDU does). Convert it to the local
+                  // cartesian frame the solver works in.
+                  auto const& accuracy =
+                      trpPositionDefinitionType.choice.direct->accuracy;
+                  double latDeg = 0, lonDeg = 0, altM = 0;
+                  if (accuracy.present ==
+                      TRPPositionDirectAccuracy_PR_tRPPosition) {
+                    auto const& pos = accuracy.choice.tRPPosition;
+                    // TS 23.032 6.1: N <= 2^23 * |lat| / 90, N <= 2^24 * lon/360
+                    // (~1.2 m latitude steps).
+                    latDeg = (pos->latitudeSign ==
+                                      NG_RANAccessPointPosition__latitudeSign_south ?
+                                  -1.0 :
+                                  1.0) *
+                             static_cast<double>(pos->latitude) * 90.0 /
+                             (1 << 23);
+                    lonDeg = static_cast<double>(pos->longitude) * 360.0 /
+                             (1L << 24);
+                    altM = (pos->directionOfAltitude ==
+                                    NG_RANAccessPointPosition__directionOfAltitude_depth ?
+                                -1.0 :
+                                1.0) *
+                           static_cast<double>(pos->altitude);
+                  } else if (
+                      accuracy.present ==
+                      TRPPositionDirectAccuracy_PR_tRPHAposition) {
+                    auto const& pos = accuracy.choice.tRPHAposition;
+                    // TS 23.032 6.1a/6.3a: lat = N*90/2^31, lon = N*180/2^31,
+                    // alt = N/128 m (~5 mm steps).
+                    latDeg = static_cast<double>(pos->latitude) * 90.0 /
+                             2147483648.0;
+                    lonDeg = static_cast<double>(pos->longitude) * 180.0 /
+                             2147483648.0;
+                    altM = static_cast<double>(pos->altitude) / 128.0;
+                  } else {
+                    Logger::lmf_app().warn(
+                        "trp information: unhandled "
+                        "TRPPositionDirectAccuracy_PR: %d",
+                        accuracy.present);
+                    break;
+                  }
+
+                  // The first absolute position seen anchors the local frame;
+                  // every other TRP is expressed as an offset from it
+                  // (equirectangular approximation - exact enough over a site).
+                  static bool originSet   = false;
+                  static double originLat = 0.0;
+                  static double originLon = 0.0;
+                  static double originAlt = 0.0;
+                  if (!originSet) {
+                    originLat = latDeg;
+                    originLon = lonDeg;
+                    originAlt = altM;
+                    originSet = true;
+                  }
+
+                  constexpr double kMetresPerDegLat = 111132.95;
+                  constexpr double kMetresPerDegLon = 111319.49;
+                  double const eastM = (lonDeg - originLon) *
+                                       kMetresPerDegLon *
+                                       std::cos(originLat * M_PI / 180.0);
+                  double const northM = (latDeg - originLat) * kMetresPerDegLat;
+
+                  trp.relativeCartesianLocation.xYZunit =
+                      RelativeCartesianLocation__xYZunit_cm;
+                  trp.relativeCartesianLocation.xvalue =
+                      std::lround(eastM * 100.0);
+                  trp.relativeCartesianLocation.yvalue =
+                      std::lround(northM * 100.0);
+                  trp.relativeCartesianLocation.zvalue =
+                      std::lround((altM - originAlt) * 100.0);
+
+                  Logger::lmf_app().info(
+                      "trp information: direct position lat: %.7f lon: %.7f "
+                      "alt: %.1fm -> local x: %ldcm y: %ldcm z: %ldcm",
+                      latDeg, lonDeg, altM,
+                      trp.relativeCartesianLocation.xvalue,
+                      trp.relativeCartesianLocation.yvalue,
+                      trp.relativeCartesianLocation.zvalue);
+                } break;
+
                 default:
                   Logger::lmf_app().warn(
                       "trp information: unhandled "
@@ -600,7 +1092,7 @@ void lmf_app::handle_trp_information_response(
 
             default:
               Logger::lmf_app().warn(
-                  "trp information: unhandled TRPInformationItem_PR: %d",
+                  "trp information: unhandled TRPInformationTypeResponseItem_PR: %d",
                   trpInformationItem->present);
           }
         }
@@ -622,10 +1114,13 @@ void lmf_app::handle_trp_information_response(
                   "trpId: "s + std::to_string(trpId) + " already inserted"s);
             }
           } else {
-            oai::lmf::api::lmf_sbi_helper::throwHttpError(
-                "trp information response",
-                "gnb_id: " + std::to_string(gnbId.value()) + " " +
-                    "trp_id: " + std::to_string(trpId) + " not unique");
+            // Known TRP answering again (every location session asks): what changes with a gNB restart - its SFN
+            // timing and PRS - is refreshed; the position is not.
+            auto& known     = this->gnb.at(gnbId.value()).trp.at(trpId);
+            known.pci       = trp.pci;
+            known.arfcn     = trp.arfcn;
+            known.prs       = trp.prs;
+            known.sfn0_unix = trp.sfn0_unix;
           }
         } else {
           oai::lmf::api::lmf_sbi_helper::throwHttpError(
@@ -648,6 +1143,19 @@ bool lmf_app::handle_non_ue_n2info_nrppa_notification(NrppaPduShared nrppa) {
 //------------------------------------------------------------------------------
 // TODO: replace bool retval with exception
 // shoult not fail
+void lmf_app::handle_n1_lpp_notification(
+    std::string const& supi, std::string const& correlation_id,
+    std::string const& lpp_pdu) {
+  auto ctx = this->supi_2_context(supi);
+  if (!ctx) {
+    oai::lmf::api::lmf_sbi_helper::throwHttpError(
+        "N1MessageNotify (LPP)"s, "no location session for "s + supi, "",
+        Pistache::Http::Code::Not_Found);
+  }
+  ctx->handle_lpp_uplink(correlation_id, lpp_pdu);
+}
+
+//------------------------------------------------------------------------------
 bool lmf_app::handle_n2info_nrppa_notification(
     std::string supi, NrppaPduShared nrppa) {
   auto ctx = this->supi_2_context(supi);
@@ -666,17 +1174,20 @@ bool lmf_app::handle_n2info_nrppa_notification(
         "NRPPA_PDU_PR_initiatingMessage not implemented");
   }
 
-  if (ctx->nrppa_tId.count(tId) != 1) {
-    oai::lmf::api::lmf_sbi_helper::throwHttpError(
-        "handle_n2info_nrppa_notification"s,
-        "unknown nrppa transaction id: "s + std::to_string(tId));
-  }
-
-  auto const procedureCode = ctx->nrppa_tId.at(tId);
-  // with multiple gnb expect multiple trp infos, erase after timeout
-  if (procedureCode != ProcedureCode_id_tRPInformationExchange) {
-    ctx->nrppa_tId.erase(tId);          // not for incomming/initiating!
-    this->nrppa_tid_gen.free_uid(tId);  // for reuse
+  ProcedureCode_t procedureCode;
+  {
+    std::scoped_lock lk{ctx->m_tId};
+    if (ctx->nrppa_tId.count(tId) != 1) {
+      oai::lmf::api::lmf_sbi_helper::throwHttpError(
+          "handle_n2info_nrppa_notification"s,
+          "unknown nrppa transaction id: "s + std::to_string(tId));
+    }
+    procedureCode = ctx->nrppa_tId.at(tId);
+    // with multiple gnb expect multiple trp infos, erase after timeout
+    if (procedureCode != ProcedureCode_id_tRPInformationExchange) {
+      ctx->nrppa_tId.erase(tId);          // not for incomming/initiating!
+      this->nrppa_tid_gen.free_uid(tId);  // for reuse
+    }
   }
   // is non-ue but not a broadcast like trp-info
   // TODO: introduce non-ue "was broadcast" switch
@@ -729,7 +1240,7 @@ bool lmf_app::handle_n2info_nrppa_notification(
         auto const& measurementFailure = getPR(
             value.choice.MeasurementFailure, value,
             UnsuccessfulOutcome__value_PR_MeasurementFailure);
-        ctx->handle_measurement_failure(nrppa, measurementFailure);
+        ctx->handle_measurement_failure(nrppa, tId, measurementFailure);
         return true;
       }; break;
 
@@ -769,7 +1280,7 @@ bool lmf_app::handle_n2info_nrppa_notification(
       auto const& measurementResponse = getPR(
           value.choice.MeasurementResponse, value,
           SuccessfulOutcome__value_PR_MeasurementResponse);
-      ctx->handle_measurement_response(nrppa, measurementResponse);
+      ctx->handle_measurement_response(nrppa, tId, measurementResponse);
       return true;
     } break;
 

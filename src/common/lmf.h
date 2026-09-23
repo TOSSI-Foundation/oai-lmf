@@ -12,6 +12,7 @@
 #define NRF_REGISTRATION_RETRY_TIMER 5
 
 #define N2_NRPPa_CONTENT_ID "n2NrppaMsg"
+#define N1_LPP_CONTENT_ID "n1LppMsg"
 
 #define _unused(x) ((void) (x))
 

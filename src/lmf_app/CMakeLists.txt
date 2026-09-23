@@ -6,7 +6,7 @@ include_directories(${SRC_TOP_DIR}/api_server/api)
 include_directories(${SRC_TOP_DIR}/api_server/impl)
 include_directories(${SRC_TOP_DIR}/api_server/)
 include_directories(${SRC_TOP_DIR}/common/)
-#include_directories(${SRC_TOP_DIR}/lpp)
+include_directories(${SRC_TOP_DIR}/lpp)
 include_directories(${SRC_TOP_DIR}/nrppa)
 include_directories(${SRC_TOP_DIR}/${MOUNTED_COMMON}/common)
 include_directories(${SRC_TOP_DIR}/${MOUNTED_COMMON}/config)
@@ -32,6 +32,8 @@ pkg_check_modules(cblas cblas)
 
 file(GLOB LMF_src_files
   lmf_app.cpp
+  lmf_lpp.cpp
+  lmf_ntn.cpp
   lmf_config.cpp
   lmf_config_yaml.cpp 
   task_manager.cpp

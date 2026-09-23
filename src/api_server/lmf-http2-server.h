@@ -29,6 +29,10 @@ class lmf_http2_server {
   void start();
   void non_ue_n2info_nrppa_notification_post_handler(
       std::vector<mime_part>& parts, const response& response);
+  // TS 29.518 5.2.2.3.5 N1MessageNotify for n1MessageClass LPP
+  void n1_lpp_notification_post_handler(
+      const std::string& ueContextId, std::vector<mime_part>& parts,
+      const nghttp2::asio_http2::server::response& response);
   void n2info_nrppa_notification_post_handler(
       const std::string& ueContextId, std::vector<mime_part>& parts,
       const response& response);

@@ -7,10 +7,13 @@
 
 #define ASN_DISABLE_OER_SUPPORT
 
+#include "lmf_ntn.hpp"
 #include <pistache/http.h>
 
 #include <boost/range/combine.hpp>
+#include <atomic>
 #include <condition_variable>
+#include <thread>
 #include <map>
 #include <shared_mutex>
 #include <string>
@@ -50,6 +53,11 @@ class lmf_app {
       Pistache::Http::Code& code);
   bool handle_non_ue_n2info_nrppa_notification(NrppaPduShared nrppa);
   bool handle_n2info_nrppa_notification(std::string supi, NrppaPduShared nrppa);
+  // Uplink LPP notified by the AMF (TS 29.518 5.2.2.3.5); throws an HttpError the server turns into a reply.
+  void handle_n1_lpp_notification(
+      std::string const& supi, std::string const& correlation_id,
+      std::string const& lpp_pdu);
+  std::atomic<unsigned> lmf_correlation_counter{0};
 
   bool is_supi_2_context(const std::string& supi) const;
   std::shared_ptr<LocationDetermination> create_lmf_context(
@@ -115,6 +123,16 @@ class lmf_app {
 
   // globalRanNodeList
   std::map<GnbId, Gnb> gnb;
+  // Single-satellite NTN Multi-RTT (TS 38.305 8.10): each UE's timed ranges, kept across location sessions,
+  // since the method needs one TRP at different time instances.
+  std::mutex m_ntn;
+  std::map<std::string, std::vector<ntn::range_meas>> ntn_history;
+  std::map<std::string, double> ntn_last_rtt_rate;  // us/s, for the PRS/SRS slot-gap correction
+  void ntn_record(std::string const& supi, nlohmann::json& round);
+  nlohmann::json ntn_solve(std::string const& supi);
+
+  std::atomic<bool> auto_running{false};
+  std::thread auto_thread;
   mutable std::mutex cv_m_gnb;
   std::condition_variable cv_gnb;
   auto numTrps() {

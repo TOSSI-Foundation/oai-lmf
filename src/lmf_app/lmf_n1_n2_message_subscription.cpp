@@ -90,6 +90,16 @@ std::string N1N2MessageSubscription::subscribe(std::string const& supi) {
   ueN1N2InfoSubscriptionCreateData.setN2NotifyCallbackUri(n2NotifyCallbackUri);
   ueN1N2InfoSubscriptionCreateData.setNfId(lmf_nrf_inst->lmf_instance_id);
 
+  // Same subscription also asks for uplink LPP: the AMF routes it here by the correlation ID the UE
+  // echoes, then by this nfId (TS 24.501 5.4.5.2.3 c, TS 29.518 5.2.2.3.5).
+  std::string n1NotifyCallbackUri = {};
+  lmf_sbi_helper::get_lmf_n1_notify_lpp_callback_uri(
+      lmf_cfg.sbi, supi, n1NotifyCallbackUri);
+  N1MessageClass n1MessageClass;
+  n1MessageClass.setEnumValue(N1MessageClass_anyOf::eN1MessageClass_anyOf::LPP);
+  ueN1N2InfoSubscriptionCreateData.setN1MessageClass(n1MessageClass);
+  ueN1N2InfoSubscriptionCreateData.setN1NotifyCallbackUri(n1NotifyCallbackUri);
+
   // 2. 201 Created (UeN1N2InfoSubscriptionCreatedData)
   std::string response = {};
 

@@ -29,6 +29,13 @@ class lmf_sbi_helper : public sbi_helper {
       sbi_helper::LmfN2InfoNotifyBase +
       lmf_cfg.sbi.api_version.value_or(kDefaultSbiApiVersion);
 
+  // TS 29.518 5.2.2.3.5 N1MessageNotify callback for n1MessageClass LPP: /nlmf-n1-notify/v1/lpp/callback/{supi}
+  static inline const std::string LmfN1NotifyServiceBase =
+      "/nlmf-n1-notify/" + lmf_cfg.sbi.api_version.value_or(kDefaultSbiApiVersion);
+  static inline const std::string LmfN1NotifyLppCallback = "/lpp/callback/";
+  static void get_lmf_n1_notify_lpp_callback_uri(
+      const interface_cfg_t& sbi, const std::string& supi, std::string& uri);
+
   static inline const std::string LmfNonUeN2InfoNotifyServiceBase =
       sbi_helper::LmfNonUeN2InfoNotifyBase +
       lmf_cfg.sbi.api_version.value_or(kDefaultSbiApiVersion);

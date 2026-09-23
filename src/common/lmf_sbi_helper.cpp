@@ -15,6 +15,17 @@
 #include "logger.hpp"
 
 namespace oai::lmf::api {
+
+namespace {
+// Callback URIs this LMF hands to the AMF (n2NotifyCallbackUri, n1NotifyCallbackUri) are of OpenAPI type Uri:
+// absolute, scheme included (TS 29.571 Uri, RFC 3986). get_ipv4_root() has no scheme, and a strict AMF rejects
+// such a callback ("no scheme / not absolute") and never notifies. This LMF serves them over HTTP/2 without TLS.
+std::string callback_root(const interface_cfg_t& sbi) {
+  const std::string root = sbi.get_ipv4_root();
+  return root.find("://") == std::string::npos ? "http://" + root : root;
+}
+}  // namespace
+
 //---------------------------------------------------------------------------------------------
 void lmf_sbi_helper::get_amf_comm_api_root(
     const nf_addr_t& amf_addr, std::string& api_root) {
@@ -145,7 +156,7 @@ void lmf_sbi_helper::get_lmf_loc_location_context_transfer_uri(
 //---------------------------------------------------------------------------------------------
 void lmf_sbi_helper::get_lmf_n2_info_notify_api_root(
     const interface_cfg_t& sbi, std::string& api_root) {
-  api_root = sbi.get_ipv4_root() + sbi_helper::LmfN2InfoNotifyBase +
+  api_root = callback_root(sbi) + sbi_helper::LmfN2InfoNotifyBase +
              lmf_cfg.sbi.api_version.value_or(kDefaultSbiApiVersion);
   ;
 }
@@ -176,7 +187,7 @@ void lmf_sbi_helper::get_lmf_n2_info_notify_nrppa_callback_uri(
 //---------------------------------------------------------------------------------------------
 void lmf_sbi_helper::get_lmf_non_ue_n2_info_notify_api_root(
     const interface_cfg_t& sbi, std::string& api_root) {
-  api_root = sbi.get_ipv4_root() + sbi_helper::LmfNonUeN2InfoNotifyBase +
+  api_root = callback_root(sbi) + sbi_helper::LmfNonUeN2InfoNotifyBase +
              lmf_cfg.sbi.api_version.value_or(kDefaultSbiApiVersion);
   ;
 }
@@ -219,6 +230,12 @@ void lmf_sbi_helper::throwHttpError(
 
   auto const& reason = json_data.dump();
   throw Pistache::Http::HttpError{code, reason};
+}
+
+//---------------------------------------------------------------------------------------------
+void lmf_sbi_helper::get_lmf_n1_notify_lpp_callback_uri(
+    const interface_cfg_t& sbi, const std::string& supi, std::string& uri) {
+  uri = callback_root(sbi) + LmfN1NotifyServiceBase + LmfN1NotifyLppCallback + supi;
 }
 
 }  // namespace oai::lmf::api
