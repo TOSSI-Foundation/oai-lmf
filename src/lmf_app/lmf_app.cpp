@@ -128,11 +128,10 @@ bool lmf_app::start() {
   }
   Logger::lmf_app().startup("Started");
 
-  // Periodic positioning without an external client:
-  //   LMF_AUTO_SUPI="imsi-001010000000003[,imsi-...]"  UEs to locate
-  //   LMF_AUTO_INTERVAL_S=5                            pause between fixes
-  // Each result is logged ("auto position") and appended as one JSON line to
-  // LMF_AUTO_OUTPUT (default /openair-lmf/positions/positions.jsonl).
+  // Periodic positioning without an external client: LMF_AUTO_SUPI="imsi-001010000000003[,imsi-...]"  UEs
+  // to locate LMF_AUTO_INTERVAL_S=5                            pause between fixes Each result is logged
+  // ("auto position") and appended as one JSON line to LMF_AUTO_OUTPUT (default /openair-
+  // lmf/positions/positions.jsonl).
   if (char const* supis = std::getenv("LMF_AUTO_SUPI"); supis && *supis) {
     auto_running = true;
     auto_thread  = std::thread([this, list = std::string(supis)] {
@@ -260,10 +259,7 @@ void lmf_app::trp_information(
     std::shared_ptr<LocationDetermination> const& ctx) {
   std::unique_lock lk{this->cv_m_gnb};
 
-  // Always re-query: a gNB (e.g. OCUDU) only accepts UE positioning requests
-  // after it has answered a TRP Information request itself, so a cached list
-  // breaks as soon as a gNB restarts. It also picks up moved TRPs.
-  // ponytail: concurrent determine-location requests share this map.
+  // Always re-query: a gNB (e.g.
   this->gnb.clear();
 
   auto const& tId = this->nrppa_tid_gen.get_uid();
@@ -338,10 +334,10 @@ void lmf_app::handle_determine_location(
     return;
   }
 
-  // LCS correlation ID of this location session: the AMF's, when it sent one in Nlmf_Location_DetermineLocation
-  // (TS 23.273 6.1.1 step 7, InputData.correlationID in TS 29.572); otherwise this LMF assigns one, from its
-  // own "lmf-" range so the two kinds stay distinguishable (TS 24.501 5.4.5.3.2 NOTE 2, TS 23.273 6.3.1
-  // NOTE 11). The auto-positioning loop, standing in for an AMF-triggered request, lands in the second case.
+  // LCS correlation ID of this location session: the AMF's, when it sent one in
+  // Nlmf_Location_DetermineLocation (TS 23.273 6.1.1 step 7, InputData.correlationID in TS 29.572);
+  // otherwise this LMF assigns one, from its own "lmf-" range so the two kinds stay distinguishable (TS
+  // 24.501 5.4.5.3.2 NOTE 2, TS 23.273 6.3.1 NOTE 11).
   ctx->lcs_correlation_id =
       inputData.correlationIDIsSet() && !inputData.getCorrelationID().empty() ?
           inputData.getCorrelationID() :
@@ -437,10 +433,7 @@ void lmf_app::handle_determine_location(
   // over this UE's history before the terrestrial solver below, which needs several TRPs and throws without.
   nlohmann::json ntn_fix;
   if (multi_rtt) ntn_fix = this->ntn_solve(supi);
-  // The terrestrial solver needs several TRPs at known, distinct, FIXED positions. In NTN the TRP is on board
-  // the satellite (TS 38.305 5.4.2) and moves, so its geo_coordinates IE is only a placeholder - both cells
-  // report the same cell reference location - and the solver rightly refuses with "the two TRPs must be at
-  // least 1 m apart". That must not bury the NTN fix, which is the answer this deployment is after.
+  // The terrestrial solver needs several TRPs at known, distinct, FIXED positions.
   nlohmann::json locData;
   auto const ntn_status = ntn_fix.is_null() ? std::string{} : ntn_fix.value("status", std::string{});
   try {
@@ -513,11 +506,8 @@ void lmf_app::ntn_record(std::string const& supi, nlohmann::json& round) {
     h.clear();
     ntn_last_rtt_rate.erase(supi);
   }
-  // The two halves describe different uplink subframes: the gNB Rx-Tx the SRS's, the UE Rx-Tx - measured on DL
-  // subframe i - the UL subframe i + offset it transmits then (TS 38.215 5.1.30, 5.1.46). Move the UE half to the
-  // SRS's subframe at the rate the round trip changed between rounds (the gNB half barely moves: the UE's timing
-  // advance tracks the link). Without this the pair is (PRS slot - SRS slot + offset) ms apart - 9 to 24 ms here,
-  // which at 46 us/s of drift was the whole of the -0.8 us "bias" of phase 3.
+  // The two halves describe different uplink subframes: the gNB Rx-Tx the SRS's, the UE Rx-Tx - measured
+  // on DL subframe i - the UL subframe i + offset it transmits then (TS 38.215 5.1.30, 5.1.46).
   double const gap_s =
       (round["ueSlot"].get<long>() + round["subframeOffset"].get<long>() - round["gnbSlot"].get<long>()) * 1e-3;
   if (auto r = ntn_last_rtt_rate.find(supi); r != ntn_last_rtt_rate.end()) rtt -= r->second * gap_s;
@@ -541,23 +531,6 @@ void lmf_app::ntn_record(std::string const& supi, nlohmann::json& round) {
   round["satelliteId"]  = sat->id;
 
   // Neighbour TRPs - in NTN, the other satellites over this UE (TS 38.305 5.4.2, 5.4.4).
-  //
-  // Write the UE's measurement of TRP i, in its own frame grid, as
-  //
-  //   arrival_i = t_ul(0) + subframe_i + R_i        (R_i = UE Rx-Tx, its whole advance, TS 38.215 5.1.30/5.1.46)
-  //   arrival_i = sfn0_ref + subframe_i + r_i / c   (the TRP transmitted that occasion, then it flew)
-  //
-  // The second line holds for EVERY TRP with the same sfn0_ref because the UE applies each TRP's
-  // nr-DL-PRS-SFN0-Offset (37.355 6.4.3) when it looks for that TRP's occasions: after it does, the occasion it
-  // sees in its subframe n was transmitted at the same absolute instant by all of them. Subtracting the two
-  // lines, the subframe and both constants cancel:
-  //
-  //   r_j - r_ref = c (R_j - R_ref)
-  //
-  // so the round trip that fixed r_ref hands every neighbour an ABSOLUTE range, not just a difference. Two
-  // absolute ranges at one instant place the UE without waiting for a pass. The measurements need not fall in
-  // the same subframe - the two TRPs' grids are offset by their SFN0 offset - so each neighbour's range is
-  // timestamped at its own occasion.
   if (!round.contains("trps") || round["trps"].size() < 2) return;
   auto const& ts = round["trps"];
   double const r_ref_us  = ts[0]["ueRxTxUs"].get<double>();
@@ -573,9 +546,7 @@ void lmf_app::ntn_record(std::string const& supi, nlohmann::json& round) {
     gap_ms = (gap_ms % 10240 + 10240) % 10240;          // the SFN cycle wraps
     if (gap_ms > 5120) gap_ms -= 10240;
     // Two TRPs' occasions can sit up to one DL-PRS period apart on the UE's grid (their SFN0 offset), no
-    // further. Anything beyond that is not one instant - it is a TRP the UE stopped hearing whose last
-    // measurement is being repeated - and differencing it against a current one puts the range out by
-    // hundreds of kilometres. Two periods of slack, then refuse.
+    // further.
     constexpr long max_gap_ms = 320;
     if (gap_ms > max_gap_ms || gap_ms < -max_gap_ms) {
       Logger::lmf_app().warn(

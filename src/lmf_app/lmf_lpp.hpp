@@ -1,7 +1,5 @@
-/*
- * LPP (TS 37.355 v18.7.0) messages the LMF sends and receives over N1, encoded with the Rel-18 codec in
- * src/lpp (generated from src/37355-i70.asn with the LPP_ prefix). LPP is BASIC-PER, UNALIGNED (37.355 6.1).
- */
+/* LPP (TS 37.355 v18.7.0) messages the LMF sends and receives over N1, encoded with the Rel-18 codec in
+ * src/lpp (generated from src/37355-i70.asn with the LPP_ prefix). */
 #pragma once
 
 #include <optional>

@@ -9,3 +9,6 @@ build/lmf/build
 *.pcap
 
 .vscode/
+
+# build artefacts
+*.log

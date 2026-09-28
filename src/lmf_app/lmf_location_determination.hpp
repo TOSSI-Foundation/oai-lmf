@@ -142,11 +142,8 @@ class LocationDetermination {
   // One NR Multi-RTT Location Information Transfer (37.355 5.3.1) and, with the gNB Rx-Tx of the latest
   // measurement round, one round-trip time (TS 38.305 8.10). Returns the round as JSON, or throws.
   nlohmann::json lpp_multi_rtt_round(bool ntn);
-  // Assistance Data Delivery (37.355 5.2.2): NR-DL-PRS-AssistanceData from the TRP Information of the first
-  // TRP that reported a PRS Configuration. False if there is none to send.
-  // Sends the DL-PRS assistance data for every TRP that reported a PRS Configuration and returns the
-  // dl-PRS-ID each one was given, as (gnbId, trpId, dl-PRS-ID); empty if nothing could be sent. The caller
-  // records them on the TRPs under its own lock.
+  // Assistance Data Delivery (37.355 5.2.2): NR-DL-PRS-AssistanceData from the TRP Information of the
+  // first TRP that reported a PRS Configuration.
   std::vector<std::tuple<GnbId, long, long>> lpp_provide_assistance_data(std::map<GnbId, Gnb> const& gnbs);
   // gNB Rx-Tx of the last measurement round: (sfn, slot, ns). Single-TRP NTN Multi-RTT uses one.
   std::optional<std::tuple<long, long, double>> last_gnb_rxtx;

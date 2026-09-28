@@ -486,16 +486,8 @@ LocationDetermination::positioning_information_request() {
       lmf_cfg.positioning_wait_ms);
 }
 
-//------------------------------------------------------------------------------
-// The UE's SRS configuration describes when it transmits in the SERVING cell's frame grid. A neighbour TRP
-// counts frames on its own, so the same transmission falls slot_shift slots later there (TS 38.455 SRSResource,
-// ResourceTypePeriodic.offset). Without the shift the neighbour looks in the wrong slot and measures nothing.
-//
-// The structure is SHARED with every other gNB's request - the IE holds a shallow copy, so writing through it
-// writes the caller's own SRSConfiguration. It therefore has to be put back exactly as it was found, which
-// the caller does after the transfer; leaving it shifted made the serving gNB's request drift by slot_shift
-// every round, so from the second round on it asked the serving cell to measure an SRS the UE does not send.
-// The encode inside non_ue_n2_message_transfer() is synchronous, so nothing else observes it in between.
+// ------------------------------------------------------------------------------ The UE's SRS configuration
+// describes when it transmits in the SERVING cell's frame grid.
 static void shift_srs_offsets(SRSConfiguration_t& cfg, long slot_shift) {
   static long const periodicity_slots[] = {1, 2, 4, 5, 8, 10, 16, 20, 32, 40, 64, 80, 160, 320, 640, 1280, 2560};
   for (int c = 0; c < cfg.sRSCarrier_List.list.count; ++c) {
@@ -608,10 +600,7 @@ void LocationDetermination::send_measurement_request(
   }
   ASN_SEQUENCE_ADD(ies, srsConfigurationIE);
 
-  // TRP Measurement Quantities is mandatory (TS 38.455, 9.1.4.1) and was
-  // missing. Ask for UL-RTOA and state the reporting granularity explicitly:
-  // compute_location() below assumes k1, and a gNB may reject the request (or
-  // assert, as OCUDU does) when the factor is absent.
+  // TRP Measurement Quantities is mandatory (TS 38.455, 9.1.4.1) and was missing.
   constexpr long kTimingReportingGranularityFactor = 1;  // k1
   auto trpMeasurementQuantitiesIe =
       (MeasurementRequest_IEs_t*) calloc(1, sizeof(MeasurementRequest_IEs_t));
@@ -620,10 +609,7 @@ void LocationDetermination::send_measurement_request(
   trpMeasurementQuantitiesIe->value.present =
       MeasurementRequest_IEs__value_PR_TRPMeasurementQuantities;
 
-  // UL-RTOA feeds the solver below. gNB Rx-Tx is the gNB half of Multi-RTT
-  // (RTT = UE Rx-Tx + gNB Rx-Tx), which TS 38.305 8.10.1 uses for NTN network
-  // verification of UE location at a single TRP over several time instances;
-  // it is only logged for now. Both at k1.
+  // UL-RTOA feeds the solver below.
   for (auto const type : {TRPMeasurementType_uL_RTOA,
                           TRPMeasurementType_gNB_RxTxTimeDiff}) {
     auto trpMeasurementQuantitiesItem =
@@ -727,13 +713,7 @@ bool LocationDetermination::measurement_round(
     std::set<std::pair<long, long>> occasions;
     std::map<GnbId, std::map<TRP_ID_t, long>> round;
     for (auto& [gnb, tId, fut] : pending) {
-      // A gNB that does not answer, or answers with a failure, is skipped rather than fatal. In NTN a
-      // neighbour TRP is on another satellite: the UE's uplink is pre-compensated for the serving satellite
-      // and arrives at the neighbour milliseconds away from its own alignment, so the neighbour legitimately
-      // has no uplink measurement to give while still being the TRP whose downlink the UE measured. TS 38.305
-      // 8.10.3 step 13 pairs "each gNB for which corresponding UL and DL measurements were provided", not all
-      // of them. A stack that is wholly dead is still caught: the round is rejected below if nothing answered,
-      // and the session throws if no round is ever accepted.
+      // A gNB that does not answer, or answers with a failure, is skipped rather than fatal.
       if (fut.wait_until(deadline) != std::future_status::ready) {
         Logger::lmf_app().warn(
             "measurement: no answer from gnbId 0x%x within %ldms, that TRP sits this round out",
@@ -800,10 +780,7 @@ bool LocationDetermination::measurement_round(
               ts.slotIndex.present == TimeStampSlotIndex_PR_sCS_60  ? ts.slotIndex.choice.sCS_60 :
               ts.slotIndex.present == TimeStampSlotIndex_PR_sCS_120 ? ts.slotIndex.choice.sCS_120 :
                                                                       -1;
-          // ONE instant, not one (SFN, slot). Each gNB timestamps in its own frame grid, and two gNBs that
-          // started seconds apart number the same instant differently - so comparing (SFN, slot) across them
-          // rejected every round with "TRPs measured 2 different SRS occasions". Put each back on the
-          // reference gNB's grid first, with the same shift its request carried.
+          // ONE instant, not one (SFN, slot).
           long const sub = ((ts.systemFrameNumber * 10 + slot - shift_of[gnb->id]) % 10240 + 10240) % 10240;
           occasions.emplace(sub / 10, sub % 10);
           round[gnb->id][trpMeasurement->tRP_ID] = meas.choice.k1;
@@ -1101,10 +1078,8 @@ void LocationDetermination::throwHttpError(
       title, detail, this->supi, code);
 }
 
-//------------------------------------------------------------------------------
-// Per-TRP fixed delay (fronthaul fibre, RU group delay), e.g.
-// LMF_TRP_DELAY_NS="411:1=12.5,412:1=-3.0" (gnbId:trpId=ns). Subtracted from the
-// TRP's time of arrival. Calibrate by placing the UE at a known point.
+// ------------------------------------------------------------------------------ Per-TRP fixed delay
+// (fronthaul fibre, RU group delay), e.g.
 static std::map<std::pair<uint64_t, long>, double> const& trp_delay_ns() {
   static auto const delays = [] {
     std::map<std::pair<uint64_t, long>, double> m;
@@ -1493,20 +1468,13 @@ nlohmann::json LocationDetermination::lpp_capability_transfer() {
 //------------------------------------------------------------------------------
 std::vector<std::tuple<GnbId, long, long>> LocationDetermination::lpp_provide_assistance_data(
     std::map<GnbId, Gnb> const& gnbs) {
-  // Every TRP that reported a PRS Configuration, the first as the reference TRP. In NTN each satellite carries
-  // its own TRP (TS 38.305 5.4.2), so a UE under two satellites gets two, and the measurements it returns for
-  // them are what locates it at one instant instead of over a pass.
-  // ponytail: the reference is the first TRP in gnbId order, which in this testbed is the serving cell. Pick
-  // it by the gNB that answers the NRPPa measurements if a deployment ever orders them differently.
+  // Every TRP that reported a PRS Configuration, the first as the reference TRP.
   std::vector<lpp::dl_prs_assistance> trps;
   std::vector<std::pair<GnbId, long>> ids;
   for (auto const& [gnbId, gnb] : gnbs) {
     for (auto const& [trpId, trp] : gnb.trp) {
       if (!trp.prs) continue;
       // dl-PRS-ID is this LMF's name for the TRP in this session (37.355 6.4.3).
-      // nr-ARFCN is that of the TRP's CD-SSB (37.355 6.4.3), while the TRP Information NR ARFCN is the carrier's
-      // Point A (38.473 9.3.1.x, OCUDU reports the UL one): not the same frequency, so it is left out and the
-      // dl-PRS-ID and PCI identify the TRP.
       lpp::dl_prs_assistance a{static_cast<long>(trps.size()), trp.pci, std::nullopt, 0, 0, *trp.prs};
       trps.push_back(a);
       ids.emplace_back(gnbId, trpId);
@@ -1525,10 +1493,8 @@ std::vector<std::tuple<GnbId, long, long>> LocationDetermination::lpp_provide_as
   for (size_t i = 1; i < trps.size(); ++i) {
     auto const s = sfn0_of(ids[i].first, ids[i].second);
     if (!ref_sfn0 || !s) continue;
-    // 37.355 6.4.3: "the time offset of the SFN#0 slot#0 for the given TRP with respect to the SFN#0 slot#0 of
-    // the assistance data reference TRP", i.e. t_j - t_ref, over the 10.24 s SFN cycle. It is what tells the
-    // UE - which counts frames on the serving cell's grid - where in its own timeline this TRP's PRS occasions
-    // fall. Without it the UE would look for them in the serving cell's slot and find nothing.
+    // 37.355 6.4.3: "the time offset of the SFN#0 slot#0 for the given TRP with respect to the SFN#0
+    // slot#0 of the assistance data reference TRP", i.e.
     long const ms       = static_cast<long>(std::llround((*s - *ref_sfn0) * 1e3));
     long const positive = (ms % 10240 + 10240) % 10240;
     trps[i].sfn_offset      = positive / 10;
@@ -1629,10 +1595,7 @@ nlohmann::json LocationDetermination::lpp_multi_rtt_round(bool ntn) {
       {"timingQualityM", u.timing_quality_m},
       {"pci", u.pci.value_or(-1)},
       {"dlPrsId", u.dl_prs_id}};
-  // Every measured TRP, the reference included, in the order the UE reported them. Their downlink arrivals
-  // differ by their transmit times plus their ranges, and the LMF knows the transmit times (each TRP's SFN
-  // Initialisation Time), so each one is a range of its own once the reference round trip has fixed the
-  // UE's clock - see lmf_app::ntn_record.
+  // Every measured TRP, the reference included, in the order the UE reported them.
   nlohmann::json trps = nlohmann::json::array();
   for (auto const& t : reply->multi_rtt) {
     double const t_us = (t.subframe_offset.value_or(0) * 1000.0 * tc_per_us + t.rxtx_tc) / tc_per_us;
@@ -1644,10 +1607,9 @@ nlohmann::json LocationDetermination::lpp_multi_rtt_round(bool ntn) {
                         {"slot", t.slot},
                         {"timingQualityM", t.timing_quality_m},
                         {"pci", t.pci.value_or(-1)}};
-    // TS 38.305 8.10.3 step 13: where this TRP's own gNB also measured the UE's SRS on the same frame, the two
-    // halves close a round trip of their own and that TRP gets an independent range, not one differenced
-    // against the reference. In NTN a neighbour satellite usually cannot - the UE's uplink is pre-compensated
-    // for the serving satellite - so this is present only when it managed to.
+    // TS 38.305 8.10.3 step 13: where this TRP's own gNB also measured the UE's SRS on the same frame,
+    // the two halves close a round trip of their own and that TRP gets an independent range, not one
+    // differenced against the reference.
     auto const g = this->gnb_of_dl_prs_id.find(t.dl_prs_id);
     if (g != this->gnb_of_dl_prs_id.end()) {
       auto const r = this->gnb_rxtx.find(g->second);
@@ -1660,11 +1622,7 @@ nlohmann::json LocationDetermination::lpp_multi_rtt_round(bool ntn) {
     trps.push_back(e);
   }
   j["trps"] = trps;
-  // The REFERENCE TRP's half, not whichever gNB answered last. With two gNBs the map is walked in gnbId
-  // order, so last_gnb_rxtx ended up holding the NEIGHBOUR's - in its own frame grid, and in NTN usually a
-  // zero measurement, because a neighbour satellite cannot hear an uplink pre-compensated for another one.
-  // Pairing the UE's half against that never matched on SFN, so every round came back unpaired and the
-  // solver got nothing.
+  // The REFERENCE TRP's half, not whichever gNB answered last.
   auto const ref_gnb = this->gnb_of_dl_prs_id.find(0);
   auto const ref_rxtx = ref_gnb == this->gnb_of_dl_prs_id.end() ? this->gnb_rxtx.end()
                                                                 : this->gnb_rxtx.find(ref_gnb->second);

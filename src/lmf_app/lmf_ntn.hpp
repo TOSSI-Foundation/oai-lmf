@@ -1,27 +1,6 @@
-/*
- * Single-satellite NTN Multi-RTT location (TS 38.305 8.10, network verification of UE location in NTN): the
- * round trips measured at one TRP at different time instances, the satellite's position at each instant, and a
- * least-squares UE position on the Earth's surface.
- *
- * The satellite information comes from OAM, as 38.305 5.4 has it ("the LMF is configured by the OAM with
- * satellite related information ... as well as the association between TRP(s) and satellite(s)"): a JSON file
- * named by LMF_NTN_SATELLITES, re-read whenever it changes. Its ephemeris is an ECEF state vector at an epoch,
- * as SIB19's positionVelocity-r17, propagated as a two-body orbit in an inertial frame aligned with ECEF at the
- * epoch, the Earth turning under it at 7.2921151467e-5 rad/s.
- *
- *   {"satellites": [{"id": 0, "epoch": "2026-09-18T19:58:54Z",
- *                    "ecefPositionM": [x, y, z], "ecefVelocityMS": [vx, vy, vz],
- *                    "trps": [{"gnbId": 411, "trpId": 1}],
- *                    "commonDelayUs": 0, "rttCalibrationNs": 0,
- *                    "servesFrom": "2026-09-12T19:21:45Z", "servesUntil": "2026-09-12T19:25:57Z"}]}
- *
- * servesFrom / servesUntil are optional and bound when that satellite carries the TRP: a satellite switch
- * (TS 38.331 satSwitchWithReSync-r18) hands the same cell from one satellite to the next, so the association is
- * a function of time, not just of the TRP.
- *
- * commonDelayUs: the part of the RTT not on the service link (ta-Common / feeder link), removed before ranging.
- * rttCalibrationNs: a per-TRP RTT correction, the NTN counterpart of LMF_TRP_DELAY_NS.
- */
+/* Single-satellite NTN Multi-RTT location (TS 38.305 8.10, network verification of UE location in NTN): the
+ * round trips measured at one TRP at different time instances, the satellite's position at each instant, and
+ * a least-squares UE position on the Earth's surface. */
 #pragma once
 
 #include <array>
